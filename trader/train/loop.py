@@ -31,6 +31,21 @@ from .ppo import collect, compute_gae, ppo_update
 
 AGENTS = ["predictor", "analyst", "trader"]
 
+# Fixed metric-key schemas per agent, mirroring exactly what predictor.loss(),
+# analyst.loss() and ppo_update() return. These MUST be static (not derived from
+# whatever keys happen to be in a given rank's local `metrics` dict) because in a
+# heterogeneous multi-GPU plan different ranks own different agents and therefore
+# compute different subsets of metrics each epoch. Using fixed schemas lets every
+# rank issue the exact same sequence of collective ops (same tensor sizes, same
+# order) regardless of what it owns -- see _reduce_metrics.
+PREDICTOR_KEYS = ["pred_nll", "pred_ce", "pred_dir_acc", "pred_ic"]
+ANALYST_KEYS = ["an_ce", "an_vol", "an_align", "an_risk", "an_acc", "an_conf"]
+TRADER_KEYS = ["pg_loss", "v_loss", "entropy", "kl", "clipfrac", "grad_norm",
+               "ppo_epochs_run"]
+AGENT_METRIC_KEYS = {"predictor": PREDICTOR_KEYS, "analyst": ANALYST_KEYS,
+                      "trader": TRADER_KEYS}
+_AGENT_SPECIFIC_KEYS = {k for keys in AGENT_METRIC_KEYS.values() for k in keys}
+
 
 class Trainer:
     def __init__(self, cfg, plan, rank: int, root: str = "."):
@@ -115,13 +130,49 @@ class Trainer:
                 p.grad /= n
 
     def _reduce_metrics(self, m: Dict[str, float]) -> Dict[str, float]:
+        """Average metrics across ranks for logging/plotting on rank 0.
+
+        Every rank always computes the "common" keys (env.summary() + leverage/
+        day_vol/epoch_sec), so those are safe to all-reduce over the whole world.
+        The agent-specific keys (pred_*, an_*, ppo/trader stats) are only produced
+        by the rank(s) that own that agent this epoch, so they are: (a) averaged
+        within just that agent's owner sub-group (no-op if it has one owner), then
+        (b) broadcast from that agent's designated source rank to everyone, so
+        rank 0 can log/plot them even if it doesn't own that agent. Both (a) and
+        (b) are called by every rank in the same fixed order every epoch (the
+        AGENTS loop), so the set of collective calls is identical across ranks --
+        unlike the old version, which built the all-reduce tensor from each rank's
+        *local* dict keys and therefore mismatched in size whenever ranks owned
+        different agents (this caused an NCCL collective-size mismatch and an
+        indefinite hang/timeout under real multi-GPU role assignment).
+        """
+        out = dict(m)
         if self.world < 2 or not dist.is_initialized():
-            return m
-        keys = sorted(m.keys())
-        t = torch.tensor([float(m[k]) for k in keys], device=self.device)
-        dist.all_reduce(t, op=dist.ReduceOp.SUM)
-        t /= self.world
-        return {k: float(v) for k, v in zip(keys, t.tolist())}
+            return out
+
+        common_keys = sorted(k for k in m if k not in _AGENT_SPECIFIC_KEYS)
+        if common_keys:
+            t = torch.tensor([float(m[k]) for k in common_keys], device=self.device)
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            t /= self.world
+            out.update(zip(common_keys, t.tolist()))
+
+        for a in AGENTS:
+            keys = AGENT_METRIC_KEYS[a]
+            owners = self.plan.owners_of(a)
+            if not owners:
+                continue
+            if a in self.owned:
+                t = torch.tensor([float(m.get(k, 0.0)) for k in keys], device=self.device)
+                g = self.groups.get(a)
+                if g is not None:
+                    dist.all_reduce(t, op=dist.ReduceOp.SUM, group=g)
+                    t /= float(len(owners))
+            else:
+                t = torch.zeros(len(keys), device=self.device)
+            dist.broadcast(t, src=self.src[a])
+            out.update(zip(keys, t.tolist()))
+        return out
 
     # ------------------------------------------------------------------ epoch
     def _forward_context(self, feats: torch.Tensor, need_grad: bool):
