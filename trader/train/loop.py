@@ -194,16 +194,23 @@ class Trainer:
             for a in ("predictor", "analyst"):
                 if a in self.owned:
                     self.opt[a].zero_grad(set_to_none=True)
-            self.scaler["analyst" if "analyst" in self.owned else "predictor"] \
-                .scale(total).backward()
+            # A single combined backward pass feeds gradients into whichever of
+            # predictor/analyst this rank owns, so ONE GradScaler must own the
+            # whole iteration: the same scaler instance has to be used for
+            # scale() -> backward() -> unscale_() -> step() for every optimizer
+            # touched this step, with update() called exactly once at the end.
+            # Using a different (unused) scaler per-agent made unscale_() assert
+            # on a scaler whose _scale was never initialized this iteration.
+            shared_key = "analyst" if "analyst" in self.owned else "predictor"
+            shared_sc = self.scaler[shared_key]
+            shared_sc.scale(total).backward()
             for a in ("predictor", "analyst"):
                 if a in self.owned:
-                    sc = self.scaler[a]
-                    sc.unscale_(self.opt[a])
+                    shared_sc.unscale_(self.opt[a])
                     torch.nn.utils.clip_grad_norm_(self.models[a].parameters(), 1.0)
                     self._reduce_grads(a)
-                    sc.step(self.opt[a])
-                    sc.update()
+                    shared_sc.step(self.opt[a])
+            shared_sc.update()
 
         if (epoch + 1) % cfg.train.sync_every == 0:
             self._sync_weights()
